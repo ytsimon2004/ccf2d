@@ -21,7 +21,7 @@ class ViewOptions(AbstractParser):
         '-R', '--raw',
         validator=validator.path.is_exists(),
         group=GROUP_IO,
-        help='raw image path (after down-sampling)'
+        help='raw image path (after resize to allen space)'
     )
 
     trans_matrix: Path = argument(

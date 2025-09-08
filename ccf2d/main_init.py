@@ -35,7 +35,7 @@ class InitOptions(AbstractParser):
     )
 
     def run(self):
-        fprint(f'Initialing project (relevant cache downloading ...)')
+        fprint(f'Initialing project (relevant cache downloading (~5GB) ...)')
         if self.use_brainglobe_source:
             self.brainglobe_init()
         else:

@@ -17,7 +17,7 @@ Command Usage
 
     Input/Output Options:
       -R RAW_IMAGE, --raw RAW_IMAGE
-                            raw image path (after down-sampling)
+                            raw image path (after resize to allen space)
       -T TRANS_MATRIX, --trans TRANS_MATRIX
                             transform matrix (3 x 3) .mat file
       -C CCF_DATA, --ccf CCF_DATA

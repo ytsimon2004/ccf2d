@@ -66,7 +66,7 @@ After installation, verify that ccf2d is working correctly:
     # Check if the command is available
     ccf2d --help
 
-    # Initialize atlas data (this will download ~500MB)
+    # Initialize atlas data (this will download ~4.5GB)
     ccf2d init
 
 .. note::
