@@ -143,7 +143,9 @@ class RegisterOptions(AbstractParser):
             i, dw, dh = state['index'], state['dw'], state['dh']
             od = lambda v: v + 1 if v != 0 else 0
             state['ann'] = ann_view.plane_at(i).with_offset(od(dw), od(dh)).image
-            return ref_view.plane_at(i).with_offset(od(dw), od(dh)).image
+            ref_plane = ref_view.plane_at(i).with_offset(od(dw), od(dh))
+            state['ref_mm'] = ref_plane.reference_value
+            return ref_plane.image
 
         def boundary_mask(ann: np.ndarray) -> np.ndarray:
             """region boundaries = pixels where the annotation id changes vs its right/down neighbour"""
@@ -218,16 +220,24 @@ class RegisterOptions(AbstractParser):
                 status.value = f'pair {len(slice_pts.data)} set — click atlas landmark {len(slice_pts.data) + 1}'
 
         w_axis, h_axis = self.AXIS.get(self.cut_plane, ('w', 'h'))
-        idx_w = SpinBox(label='slice index', value=state['index'], min=0, max=int(ref_view.n_planes) - 1)
-        dw_w = SpinBox(label=f'dw / {w_axis} tilt', value=0, min=-200, max=200)
-        dh_w = SpinBox(label=f'dh / {h_axis} tilt', value=0, min=-200, max=200)
+        res = self.resolution
+        idx_w = SpinBox(label='slice index (voxel)', value=state['index'], min=0, max=int(ref_view.n_planes) - 1)
+        dw_w = SpinBox(label=f'dw / {w_axis} tilt (voxel)', value=0, min=-200, max=200)
+        dh_w = SpinBox(label=f'dh / {h_axis} tilt (voxel)', value=0, min=-200, max=200)
         pick_w = CheckBox(label='pick points', value=True)
+
+        def info_text() -> str:
+            return (f"index {state['index']} = {state.get('ref_mm', '?')} mm from Bregma   ·   "
+                    f"dw {state['dw'] * res} µm, dh {state['dh'] * res} µm")
+
+        info_w = Label(value=info_text())
         status = Label(value='click an atlas landmark (left), then its match on the histology (right)')
 
         def refresh(*_):
             state['index'], state['dw'], state['dh'] = idx_w.value, dw_w.value, dh_w.value
             atlas_layer.data = plane_image()
             bound_layer.data = boundary_mask(state['ann'])
+            info_w.value = info_text()
 
         idx_w.changed.connect(refresh)
         dw_w.changed.connect(refresh)
@@ -329,7 +339,7 @@ class RegisterOptions(AbstractParser):
         clear_btn.changed.connect(on_clear)
 
         viewer.window.add_dock_widget(
-            Container(widgets=[idx_w, dw_w, dh_w, pick_w, undo_btn, clear_btn,
+            Container(widgets=[idx_w, dw_w, dh_w, info_w, pick_w, undo_btn, clear_btn,
                                preview_btn, exit_preview_btn, save_btn, status]),
             area='right', name='register'
         )
