@@ -10,7 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "argclz>=1.0.1",
     "neura-library[atlas]>=0.5.2",
-    "numba>=0.60"
+    "numba>=0.60",
+    "napari[pyqt5]",
+    "imageio",
 ]
 
 [project.optional-dependencies]

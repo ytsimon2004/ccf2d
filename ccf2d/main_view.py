@@ -1,13 +1,13 @@
+import json
 from pathlib import Path
 
 import polars as pl
 from argclz import AbstractParser, argument, str_tuple_type, validator
 from brainglobe_atlasapi.bg_atlas import BrainGlobeAtlas
-from neuralib.atlas.ccf.matrix import load_transform_matrix, SLICE_DIMENSION_10um, slice_transform_helper, \
-    CCFTransMatrix
+from neuralib.atlas.ccf.matrix import load_transform_matrix, SLICE_DIMENSION_10um, slice_transform_helper
 from neuralib.atlas.typing import PLANE_TYPE
+from neuralib.atlas.view import SlicePlane, get_slice_view
 from neuralib.plot import plot_figure
-from matplotlib.axes import Axes
 
 __all__ = ['ViewOptions']
 
@@ -117,33 +117,41 @@ class ViewOptions(AbstractParser):
         x, y = SLICE_DIMENSION_10um[self.cut_plane]
         extent = (-x / 2, x / 2, -y / 2, y / 2)
 
+        plane, title = self._resolve_plane()
+
         if self.overlay_only:
             with plot_figure(self.output) as ax:
                 ax.imshow(trans, extent=extent)
-
-                matrix = load_transform_matrix(self.ccf_data, self.cut_plane)
-                plane = matrix.get_slice_plane()
                 plane.plot_boundaries(ax=ax, extent=extent, cmap='binary_r', alpha=0.7)
-                self.with_title(matrix, ax)
+                ax.set_title(title)
 
         else:
             with plot_figure(self.output, 1, 3) as ax:
                 ax[0].imshow(raw)
                 ax[0].set_title('resized raw')
 
-                matrix = load_transform_matrix(self.ccf_data, self.cut_plane)
                 ax[1].imshow(trans, extent=extent)
-                plane = matrix.get_slice_plane()
                 plane.plot_boundaries(ax=ax[1], extent=extent, cmap='binary_r', alpha=0.7)
-                self.with_title(matrix, ax[1])
+                ax[1].set_title(title)
 
                 regions = list(self.annotation_region) if self.annotation_region else None
                 plane.plot(ax=ax[2], annotation_region=regions, extent=extent, boundaries=True)
 
-    @staticmethod
-    def with_title(matrix: CCFTransMatrix, ax: Axes):
-        v = [f'{matrix.get_slice_plane().reference_value}mm from Bregma',
-             f'index: {matrix.slice_index}',
-             f'dw: {matrix.delta_xy[0]}',
-             f'dh: {matrix.delta_xy[1]}']
-        ax.set_title('\n'.join(v))
+    def _resolve_plane(self) -> tuple[SlicePlane, str]:
+        """Build the reference ``SlicePlane`` + title from either the native ``.json``
+        metadata (written by ``ccf2d register``) or the MATLAB ``.mat`` struct."""
+        if self.ccf_data.suffix == '.json':
+            meta = json.loads(self.ccf_data.read_text())
+            dw, dh = int(meta['dw']), int(meta['dh'])
+            plane = (get_slice_view('reference', self.cut_plane, resolution=int(meta['resolution']))
+                     .plane_at(int(meta['slice_index']))
+                     .with_offset(dw + 1 if dw != 0 else 0, dh + 1 if dh != 0 else 0))
+            title = '\n'.join([f'{plane.reference_value}mm from Bregma',
+                               f'index: {meta["slice_index"]}', f'dw: {dw}', f'dh: {dh}'])
+            return plane, title
+
+        matrix = load_transform_matrix(self.ccf_data, self.cut_plane)
+        title = '\n'.join([f'{matrix.get_slice_plane().reference_value}mm from Bregma',
+                           f'index: {matrix.slice_index}',
+                           f'dw: {matrix.delta_xy[0]}', f'dh: {matrix.delta_xy[1]}'])
+        return matrix.get_slice_plane(), title
