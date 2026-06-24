@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import imageio.v3 as iio
 import numpy as np
-from argclz import AbstractParser, argument, validator
+from argclz import AbstractParser, argument
 from brainglobe_atlasapi import BrainGlobeAtlas
 from neuralib.atlas.ccf.matrix import SLICE_DIMENSION_10um
 from neuralib.atlas.typing import PLANE_TYPE
@@ -97,10 +97,10 @@ def save_transform(matrix: np.ndarray, *,
 class RegisterOptions(AbstractParser):
     DESCRIPTION = 'Interactively register a histology slice to the Allen CCF (napari)'
 
-    raw_image: Path = argument(
+    raw_image: Path | None = argument(
         '-I', '--image',
-        validator=validator.path.is_exists(),
-        help='histology image path (registered in atlas space)'
+        default=None,
+        help='histology image path (optional; can also load it from the GUI)'
     )
 
     cut_plane: PLANE_TYPE = argument(
@@ -132,36 +132,62 @@ class RegisterOptions(AbstractParser):
         default=None,
         help='resume from a saved *_transform.json (restores points + index/dw/dh/rotate/flips)'
     )
+    directory: Path | None = argument(
+        '-D', '--directory',
+        default=None,
+        help='folder of serial sections; step through them with Prev/Next in the GUI'
+    )
+
+    _IMG_EXT = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
+
+    def _list_images(self, d: Path) -> list[Path]:
+        return sorted(p for p in Path(d).iterdir() if p.suffix.lower() in self._IMG_EXT)
 
     def run(self):
         if self.cut_plane not in SLICE_DIMENSION_10um:
             raise ValueError(f'plane {self.cut_plane!r} not supported yet '
                              f'(available: {list(SLICE_DIMENSION_10um)})')
 
-        out_dir = self.output_dir or self.raw_image.parent / 'transformations'
-        name = self.name or self.raw_image.stem
-
         load = json.loads(self.load.read_text()) if self.load else None
         if load:  # resume: preprocessing must match the saved session
             self.flip_lr = load.get('flip_lr', self.flip_lr)
             self.flip_ud = load.get('flip_ud', self.flip_ud)
+            if self.raw_image is None:
+                raise ValueError('--load needs the matching image via -I/--image')
+
+        files = self._list_images(self.directory) if self.directory else []
+        if files and self.raw_image is None:
+            self.raw_image = files[0]
+
+        base = self.raw_image.parent if self.raw_image else Path.cwd()
+        out_dir = self.output_dir or base / 'transformations'
+        name = self.name or (self.raw_image.stem if self.raw_image else 'untitled')
 
         view = get_slice_view('reference', self.cut_plane, resolution=self.resolution)
         atlas_w = int(view.width)
 
-        oriented = iio.imread(self.raw_image)
-        if self.flip_ud:
-            oriented = np.flipud(oriented)
-        if self.flip_lr:
-            oriented = np.fliplr(oriented)
-        self._oriented = oriented  # pre-rotate, pre-resize; the rotation slider re-derives from this
+        self._oriented = self._read_oriented(self.raw_image)  # None until an image is loaded
+        self._launch_napari(view, atlas_w, out_dir, name, load, files)
 
-        self._launch_napari(view, atlas_w, out_dir, name, load)
+    def _read_oriented(self, path: Path | None) -> np.ndarray | None:
+        """read an image and apply the current flips (pre-rotate, pre-resize)"""
+        if path is None:
+            return None
+        img = iio.imread(path)
+        # normalize channel-first (C, H, W) tiffs to channel-last (H, W, C)
+        if img.ndim == 3 and img.shape[0] in (3, 4) and img.shape[-1] not in (3, 4):
+            img = np.moveaxis(img, 0, -1)
+        if self.flip_ud:
+            img = np.flipud(img)
+        if self.flip_lr:
+            img = np.fliplr(img)
+        return img
 
     # (width, height) anatomical axes per plane, for tilt labels
     AXIS = {'coronal': ('ML', 'DV'), 'sagittal': ('AP', 'DV')}
 
-    def _launch_napari(self, ref_view, atlas_w: int, out_dir: Path, name: str, load: dict | None = None):
+    def _launch_napari(self, ref_view, atlas_w: int, out_dir: Path, name: str,
+                       load: dict | None = None, files: list[Path] | None = None):
         import napari
         from magicgui.widgets import CheckBox, ComboBox, Container, Label, PushButton, SpinBox
 
@@ -169,12 +195,18 @@ class RegisterOptions(AbstractParser):
         dim = SLICE_DIMENSION_10um[self.cut_plane]
 
         def make_hist(angle: float) -> np.ndarray:
+            if self._oriented is None:
+                return np.zeros((dim[1], dim[0]))  # placeholder until an image is loaded
             return cv2.resize(_rotate(self._oriented, angle), dim)
 
         angle0 = float(load.get('rotate', 0.0))
         state = {'index': int(load.get('slice_index', int(ref_view.n_planes) // 2)),
                  'dw': int(load.get('dw', 0)), 'dh': int(load.get('dh', 0)),
-                 'expect': 'atlas', 'ann': None, 'hist': make_hist(angle0)}
+                 'expect': 'atlas', 'ann': None, 'hist': make_hist(angle0),
+                 'name': name, 'out_dir': out_dir,
+                 'files': files or [], 'cursor': 0}
+        if state['files'] and self.raw_image in state['files']:
+            state['cursor'] = state['files'].index(self.raw_image)
 
         ann_view = get_slice_view('annotation', self.cut_plane, resolution=self.resolution)
         structures = BrainGlobeAtlas(f'allen_mouse_{self.resolution}um').structures
@@ -243,6 +275,14 @@ class RegisterOptions(AbstractParser):
         atlas_pts = viewer.add_points(name='atlas_pts', **pts_kw('red'))
         slice_pts = viewer.add_points(name='slice_pts', **pts_kw('cyan'))
 
+        def set_histology(img: np.ndarray):
+            # re-create the layer so napari re-detects rgb/ndim (grayscale<->RGB safely), keep its position
+            nonlocal hist_layer
+            idx = viewer.layers.index(hist_layer)
+            viewer.layers.remove(hist_layer)
+            hist_layer = viewer.add_image(img, name='histology', translate=(0, atlas_w))
+            viewer.layers.move(len(viewer.layers) - 1, idx)
+
         def renumber(layer):
             layer.features = {'n': np.array([str(i + 1) for i in range(len(layer.data))], dtype='<U3')}
 
@@ -278,6 +318,7 @@ class RegisterOptions(AbstractParser):
 
         w_axis, h_axis = self.AXIS.get(self.cut_plane, ('w', 'h'))
         res = self.resolution
+        plane_w = ComboBox(label='plane', choices=list(SLICE_DIMENSION_10um), value=self.cut_plane)
         idx_w = SpinBox(label='slice index (voxel)', value=state['index'], min=0, max=int(ref_view.n_planes) - 1)
         dw_w = SpinBox(label=f'dw / {w_axis} tilt (voxel)', value=state['dw'], min=-200, max=200)
         dh_w = SpinBox(label=f'dh / {h_axis} tilt (voxel)', value=state['dh'], min=-200, max=200)
@@ -373,12 +414,16 @@ class RegisterOptions(AbstractParser):
             status.value = 'preview closed'
 
         def on_save():
+            if self._oriented is None:
+                status.value = 'load an image first'
+                return
             s, a = collect()
             try:
                 m = estimate_transform(s, a, affine=self.affine)
             except ValueError as e:
                 status.value = f'save failed: {e}'
                 return
+            out_dir, name = state['out_dir'], state['name']
             contrast = tuple(float(v) for v in hist_layer.contrast_limits)
             save_transform(m, output_dir=out_dir, name=name, plane=self.cut_plane,
                            resolution=self.resolution, slice_index=state['index'],
@@ -402,7 +447,7 @@ class RegisterOptions(AbstractParser):
             iio.imwrite(overlay_path, rgb)
             print_save(overlay_path)
 
-            status.value = f'saved {name} transform (.npy/.json) + transformed/overlay .tif'
+            status.value = f'saved {name} transform (.json) + transformed/overlay .tif'
 
         def on_undo():
             # remove the most recently added point and restore the alternation state
@@ -423,6 +468,111 @@ class RegisterOptions(AbstractParser):
             state['expect'] = 'atlas'
             status.value = 'cleared all points'
 
+        def rebuild_plane(*_):
+            # plane drives the atlas/annotation views, dimensions and atlas_w; rebuild them all
+            nonlocal ref_view, ann_view, atlas_w, dim
+            self.cut_plane = plane_w.value
+            ref_view = get_slice_view('reference', self.cut_plane, resolution=self.resolution)
+            ann_view = get_slice_view('annotation', self.cut_plane, resolution=self.resolution)
+            atlas_w = int(ref_view.width)
+            dim = SLICE_DIMENSION_10um[self.cut_plane]
+
+            state['index'] = min(state['index'], ref_view.n_planes - 1)
+            idx_w.max = ref_view.n_planes - 1
+            idx_w.value = state['index']
+            wa, ha = self.AXIS.get(self.cut_plane, ('w', 'h'))
+            dw_w.label, dh_w.label = f'dw / {wa} tilt (voxel)', f'dh / {ha} tilt (voxel)'
+
+            atlas_layer.data = plane_image()
+            bound_layer.data = boundary_mask(state['ann'])
+            state['hist'] = make_hist(rot_w.value)
+            set_histology(state['hist'])
+
+            gw, gh = dim  # rebuild the grid for the new dimensions/placement
+            g = np.zeros((gh, gw), dtype=float)
+            g[::step, :] = 1
+            g[:, ::step] = 1
+            g[-1, :] = g[:, -1] = 1
+            grid_layer.data = g
+            grid_layer.translate = (0, atlas_w)
+
+            on_clear()
+            info_w.value = info_text()
+            status.value = f'plane: {self.cut_plane}'
+
+        plane_w.changed.connect(rebuild_plane)
+
+        def restore_from_meta(meta: dict):
+            # set widgets first (their callbacks rebuild the view / clear stale points), then points
+            idx_w.value = int(meta.get('slice_index', idx_w.value))
+            dw_w.value = int(meta.get('dw', 0))
+            dh_w.value = int(meta.get('dh', 0))
+            rot_w.value = float(meta.get('rotate', 0.0))
+            ax = np.asarray(meta.get('atlas_xy', []), dtype=float).reshape(-1, 2)
+            sx = np.asarray(meta.get('slice_xy', []), dtype=float).reshape(-1, 2)
+            atlas_pts.data = ax[:, ::-1] if len(ax) else np.empty((0, 2))
+            slice_pts.data = sx[:, ::-1] + np.array([0, atlas_w]) if len(sx) else np.empty((0, 2))
+            renumber(atlas_pts)
+            renumber(slice_pts)
+            state['expect'] = 'atlas' if len(ax) == len(sx) else 'slice'
+
+        def load_image_path(p: Path):
+            p = Path(p)
+            self._oriented = self._read_oriented(p)
+            state['name'] = self.name or p.stem
+            state['out_dir'] = self.output_dir or p.parent / 'transformations'
+            state['hist'] = make_hist(rot_w.value)
+            set_histology(state['hist'])
+            on_clear()
+            viewer.title = f'ccf2d register — {state["name"]}'
+            js = state['out_dir'] / f'{p.stem}_transform.json'
+            if js.exists():
+                restore_from_meta(json.loads(js.read_text()))
+                status.value = f'{p.name} — resumed saved registration'
+            else:
+                status.value = f'loaded {p.name} — pick points'
+
+        def on_load_image():
+            from qtpy.QtWidgets import QFileDialog
+            path, _ = QFileDialog.getOpenFileName(
+                caption='Load histology image',
+                filter='Images (*.tif *.tiff *.png *.jpg *.jpeg);;All files (*)')
+            if path:
+                state['files'] = []  # single image: leave serial mode
+                load_image_path(Path(path))
+
+        def on_load_dir():
+            from qtpy.QtWidgets import QFileDialog
+            d = QFileDialog.getExistingDirectory(caption='Load serial-section folder')
+            if not d:
+                return
+            state['files'] = self._list_images(Path(d))
+            state['cursor'] = 0
+            if not state['files']:
+                status.value = 'no images found in folder'
+                return
+            load_image_path(state['files'][0])
+            status.value = f'1/{len(state["files"])}: {state["files"][0].name}'
+
+        def load_slice(delta: int):
+            files = state['files']
+            if not files:
+                status.value = 'not in directory mode — use Load dir'
+                return
+            state['cursor'] = int(np.clip(state['cursor'] + delta, 0, len(files) - 1))
+            p = files[state['cursor']]
+            load_image_path(p)
+            status.value = f'{state["cursor"] + 1}/{len(files)}: {p.name}' + (
+                ' (resumed)' if (state['out_dir'] / f'{p.stem}_transform.json').exists() else '')
+
+        load_btn = PushButton(text='Load image')
+        load_btn.changed.connect(on_load_image)
+        load_dir_btn = PushButton(text='Load dir (serial)')
+        load_dir_btn.changed.connect(on_load_dir)
+        prev_btn = PushButton(text='◀ Prev slice')
+        prev_btn.changed.connect(lambda *_: load_slice(-1))
+        next_btn = PushButton(text='Next slice ▶')
+        next_btn.changed.connect(lambda *_: load_slice(+1))
         preview_btn = PushButton(text='Preview overlay')
         preview_btn.changed.connect(on_preview)
         exit_preview_btn = PushButton(text='Exit preview')
@@ -435,18 +585,15 @@ class RegisterOptions(AbstractParser):
         clear_btn.changed.connect(on_clear)
 
         if load.get('slice_xy') or load.get('atlas_xy'):
-            ax = np.asarray(load.get('atlas_xy', []), dtype=float).reshape(-1, 2)
-            sx = np.asarray(load.get('slice_xy', []), dtype=float).reshape(-1, 2)
-            atlas_pts.data = ax[:, ::-1] if len(ax) else np.empty((0, 2))           # (x,y)->(row,col)
-            slice_pts.data = sx[:, ::-1] + np.array([0, atlas_w]) if len(sx) else np.empty((0, 2))
-            renumber(atlas_pts)
-            renumber(slice_pts)
-            state['expect'] = 'atlas' if len(ax) == len(sx) else 'slice'
-            status.value = f'resumed: {len(sx)} pair(s) loaded'
+            restore_from_meta(load)
+            status.value = f'resumed: {len(load.get("slice_xy", []))} pair(s) loaded'
+        elif state['files']:
+            load_slice(0)  # show "i/N" + auto-resume the first serial section
 
         viewer.window.add_dock_widget(
-            Container(widgets=[idx_w, dw_w, dh_w, rot_w, info_w, pick_w, grid_w, color_w,
-                               undo_btn, clear_btn, preview_btn, exit_preview_btn, save_btn, status]),
+            Container(widgets=[load_btn, load_dir_btn, prev_btn, next_btn, plane_w, idx_w, dw_w, dh_w,
+                               rot_w, info_w, pick_w, grid_w, color_w, undo_btn, clear_btn,
+                               preview_btn, exit_preview_btn, save_btn, status]),
             area='right', name='register'
         )
         fprint(f'registering {name}: pick points, Preview to verify, Save when done')
