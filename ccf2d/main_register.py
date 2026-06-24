@@ -17,11 +17,20 @@ from neuralib.util.verbose import fprint, print_save
 __all__ = ['RegisterOptions', 'estimate_transform', 'save_transform']
 
 
-def _u8(img: np.ndarray) -> np.ndarray:
-    """contrast-normalize any image to uint8"""
+def _rotate(img: np.ndarray, deg: float) -> np.ndarray:
+    """rotate about the image center, keeping the original shape"""
+    if not deg:
+        return img
+    h, w = img.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), deg, 1.0)
+    return cv2.warpAffine(img, m, (w, h))
+
+
+def _to_u8(img: np.ndarray, contrast: tuple[float, float] | None = None) -> np.ndarray:
+    """map to uint8 using the given (lo, hi) contrast window, else full min-max"""
     img = np.asarray(img, dtype=float)
-    lo, hi = float(img.min()), float(img.max())
-    return ((img - lo) / ((hi - lo) or 1.0) * 255).astype(np.uint8)
+    lo, hi = contrast if contrast is not None else (float(img.min()), float(img.max()))
+    return (np.clip((img - lo) / ((hi - lo) or 1.0), 0, 1) * 255).astype(np.uint8)
 
 
 def estimate_transform(slice_xy: np.ndarray, atlas_xy: np.ndarray, *, affine: bool = False) -> np.ndarray:
@@ -56,26 +65,33 @@ def save_transform(matrix: np.ndarray, *,
                    output_dir: Path, name: str,
                    plane: PLANE_TYPE, resolution: int,
                    slice_index: int, dw: int, dh: int,
-                   slice_xy: np.ndarray, atlas_xy: np.ndarray) -> Path:
-    """Save the 3x3 matrix (.npy) and metadata (.json). Returns the .npy path."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    npy = output_dir / f'{name}_transform.npy'
-    np.save(npy, matrix)
-    print_save(npy)
+                   slice_xy: np.ndarray, atlas_xy: np.ndarray,
+                   rotate: float = 0.0, flip_lr: bool = False, flip_ud: bool = False,
+                   contrast: tuple[float, float] | None = None) -> Path:
+    """Save the 3x3 matrix and metadata into a single ``.json``. Returns its path.
 
+    ``rotate``/``flip_lr``/``flip_ud`` record the preprocessing so the result can be
+    reproduced (raw -> flip -> rotate -> resize -> apply matrix) and the session resumed.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
     meta = {
+        'matrix': np.asarray(matrix, dtype=float).tolist(),
         'plane': plane,
         'resolution': resolution,
         'slice_index': int(slice_index),
         'dw': int(dw),
         'dh': int(dh),
-        'slice_xy': np.asarray(slice_xy, dtype=float).tolist(),  # TODO check if needed?
+        'rotate': float(rotate),
+        'flip_lr': bool(flip_lr),
+        'flip_ud': bool(flip_ud),
+        'contrast': list(contrast) if contrast is not None else None,
+        'slice_xy': np.asarray(slice_xy, dtype=float).tolist(),
         'atlas_xy': np.asarray(atlas_xy, dtype=float).tolist(),
     }
     js = output_dir / f'{name}_transform.json'
     js.write_text(json.dumps(meta, indent=2))
     print_save(js)
-    return npy
+    return js
 
 
 class RegisterOptions(AbstractParser):
@@ -106,6 +122,16 @@ class RegisterOptions(AbstractParser):
     flip_lr: bool = argument('--flip-lr', help='flip histology left-right before registration')
     flip_ud: bool = argument('--flip-ud', help='flip histology up-down before registration')
     affine: bool = argument('--affine', help='use affine instead of projective transform')
+    boundary_color: str = argument(
+        '--boundary-color',
+        default='orange',
+        help='annotation boundary overlay color (matplotlib name or #hex)'
+    )
+    load: Path | None = argument(
+        '--load',
+        default=None,
+        help='resume from a saved *_transform.json (restores points + index/dw/dh/rotate/flips)'
+    )
 
     def run(self):
         if self.cut_plane not in SLICE_DIMENSION_10um:
@@ -115,26 +141,40 @@ class RegisterOptions(AbstractParser):
         out_dir = self.output_dir or self.raw_image.parent / 'transformations'
         name = self.name or self.raw_image.stem
 
+        load = json.loads(self.load.read_text()) if self.load else None
+        if load:  # resume: preprocessing must match the saved session
+            self.flip_lr = load.get('flip_lr', self.flip_lr)
+            self.flip_ud = load.get('flip_ud', self.flip_ud)
+
         view = get_slice_view('reference', self.cut_plane, resolution=self.resolution)
         atlas_w = int(view.width)
 
-        hist = iio.imread(self.raw_image)
+        oriented = iio.imread(self.raw_image)
         if self.flip_ud:
-            hist = np.flipud(hist)
+            oriented = np.flipud(oriented)
         if self.flip_lr:
-            hist = np.fliplr(hist)
-        hist = cv2.resize(hist, SLICE_DIMENSION_10um[self.cut_plane])  # (W, H)
+            oriented = np.fliplr(oriented)
+        self._oriented = oriented  # pre-rotate, pre-resize; the rotation slider re-derives from this
 
-        self._launch_napari(view, atlas_w, hist, out_dir, name)
+        self._launch_napari(view, atlas_w, out_dir, name, load)
 
     # (width, height) anatomical axes per plane, for tilt labels
     AXIS = {'coronal': ('ML', 'DV'), 'sagittal': ('AP', 'DV')}
 
-    def _launch_napari(self, ref_view, atlas_w: int, hist: np.ndarray, out_dir: Path, name: str):
+    def _launch_napari(self, ref_view, atlas_w: int, out_dir: Path, name: str, load: dict | None = None):
         import napari
-        from magicgui.widgets import CheckBox, Container, Label, PushButton, SpinBox
+        from magicgui.widgets import CheckBox, ComboBox, Container, Label, PushButton, SpinBox
 
-        state = {'index': int(ref_view.n_planes) // 2, 'dw': 0, 'dh': 0, 'expect': 'atlas', 'ann': None}
+        load = load or {}
+        dim = SLICE_DIMENSION_10um[self.cut_plane]
+
+        def make_hist(angle: float) -> np.ndarray:
+            return cv2.resize(_rotate(self._oriented, angle), dim)
+
+        angle0 = float(load.get('rotate', 0.0))
+        state = {'index': int(load.get('slice_index', int(ref_view.n_planes) // 2)),
+                 'dw': int(load.get('dw', 0)), 'dh': int(load.get('dh', 0)),
+                 'expect': 'atlas', 'ann': None, 'hist': make_hist(angle0)}
 
         ann_view = get_slice_view('annotation', self.cut_plane, resolution=self.resolution)
         structures = BrainGlobeAtlas(f'allen_mouse_{self.resolution}um').structures
@@ -172,8 +212,11 @@ class RegisterOptions(AbstractParser):
                         features={'n': np.empty(0, dtype='<U3')},
                         text={'string': '{n}', 'color': color, 'size': 12, 'translation': [-12, 0]})
 
+        from matplotlib.colors import to_rgb
         from napari.utils import Colormap
-        orange = Colormap([[0, 0, 0], [1, 0.55, 0]], name='orange')  # 0 -> transparent (additive), 1 -> orange
+        brgb = to_rgb(self.boundary_color)  # (r, g, b) in 0..1
+        state['brgb'] = brgb
+        bcmap = Colormap([[0, 0, 0], list(brgb)], name='boundary')  # 0 -> transparent (additive), 1 -> color
 
         viewer = napari.Viewer(title=f'ccf2d register — {name}')
         viewer.text_overlay.visible = True
@@ -181,8 +224,22 @@ class RegisterOptions(AbstractParser):
         viewer.text_overlay.color = 'yellow'
         atlas_layer = viewer.add_image(plane_image(), name='atlas', colormap='gray')
         bound_layer = viewer.add_image(boundary_mask(state['ann']), name='boundaries',
-                                       colormap=orange, blending='additive', opacity=0.9)
-        hist_layer = viewer.add_image(hist, name='histology', translate=(0, atlas_w))
+                                       colormap=bcmap, blending='additive', opacity=0.9)
+        hist_layer = viewer.add_image(state['hist'], name='histology', translate=(0, atlas_w))
+
+        # reference xy grid over the histology (toggled off), 100 px spacing. drawn as an
+        # image on the pixel grid (nearest) so it scales with the slice and is zoom-stable
+        gw, gh = dim
+        step = 100
+        grid_img = np.zeros((gh, gw), dtype=float)
+        grid_img[::step, :] = 1
+        grid_img[:, ::step] = 1
+        grid_img[-1, :] = grid_img[:, -1] = 1
+        grid_layer = viewer.add_image(grid_img, name='xy_grid', translate=(0, atlas_w),
+                                      colormap='gray', blending='additive', opacity=0.5,
+                                      interpolation2d='nearest')
+        grid_layer.visible = False
+
         atlas_pts = viewer.add_points(name='atlas_pts', **pts_kw('red'))
         slice_pts = viewer.add_points(name='slice_pts', **pts_kw('cyan'))
 
@@ -222,16 +279,47 @@ class RegisterOptions(AbstractParser):
         w_axis, h_axis = self.AXIS.get(self.cut_plane, ('w', 'h'))
         res = self.resolution
         idx_w = SpinBox(label='slice index (voxel)', value=state['index'], min=0, max=int(ref_view.n_planes) - 1)
-        dw_w = SpinBox(label=f'dw / {w_axis} tilt (voxel)', value=0, min=-200, max=200)
-        dh_w = SpinBox(label=f'dh / {h_axis} tilt (voxel)', value=0, min=-200, max=200)
+        dw_w = SpinBox(label=f'dw / {w_axis} tilt (voxel)', value=state['dw'], min=-200, max=200)
+        dh_w = SpinBox(label=f'dh / {h_axis} tilt (voxel)', value=state['dh'], min=-200, max=200)
+        rot_w = SpinBox(label='rotate (deg)', value=angle0, min=-180, max=180)
         pick_w = CheckBox(label='pick points', value=True)
+        grid_w = CheckBox(label='xy grid', value=False)
+        grid_w.changed.connect(lambda *_: setattr(grid_layer, 'visible', grid_w.value))
+
+        colors = ['orange', 'red', 'cyan', 'yellow', 'magenta', 'lime', 'white', 'blue']
+        if self.boundary_color not in colors:
+            colors = [self.boundary_color] + colors
+        color_w = ComboBox(label='boundary color', choices=colors, value=self.boundary_color)
+
+        def set_bcolor(*_):
+            state['brgb'] = to_rgb(color_w.value)
+            cm = Colormap([[0, 0, 0], list(state['brgb'])], name='boundary')
+            bound_layer.colormap = cm
+            if 'preview_boundaries' in viewer.layers:
+                viewer.layers['preview_boundaries'].colormap = cm
+
+        color_w.changed.connect(set_bcolor)
+
+        def set_rotation(*_):
+            state['hist'] = make_hist(rot_w.value)
+            hist_layer.data = state['hist']
+            slice_pts.data = np.empty((0, 2))  # slice points are stale once the image rotates
+            renumber(slice_pts)
+            state['expect'] = 'atlas' if len(atlas_pts.data) == 0 else (
+                'slice' if len(atlas_pts.data) > len(slice_pts.data) else 'atlas')
+            status.value = f'rotated {rot_w.value}° — re-pick the slice points'
+
+        rot_w.changed.connect(set_rotation)
 
         def info_text() -> str:
             return (f"index {state['index']} = {state.get('ref_mm', '?')} mm from Bregma   ·   "
                     f"dw {state['dw'] * res} µm, dh {state['dh'] * res} µm")
 
         info_w = Label(value=info_text())
-        status = Label(value='click an atlas landmark (left), then its match on the histology (right)')
+        status = Label(value='click an atlas landmark (left), then its match on the slice (right)')
+        # make the live instruction line stand out (applies to every status.value message)
+        status.native.setStyleSheet('font-size: 15px; font-weight: bold; color: #ffcc00;')
+        status.native.setWordWrap(True)
 
         def refresh(*_):
             state['index'], state['dw'], state['dh'] = idx_w.value, dw_w.value, dh_w.value
@@ -264,14 +352,16 @@ class RegisterOptions(AbstractParser):
             # inverse-warp the atlas boundaries into raw-slice space so they overlay the
             # (unmodified) histology -> points stay visible and can still be added/adjusted
             bmask = boundary_mask(state['ann'])
-            h, w = bmask.shape
-            binv = cv2.warpPerspective(bmask, np.linalg.inv(m), (w, h))
+            hh, ww = state['hist'].shape[:2]
+            binv = cv2.warpPerspective(bmask, np.linalg.inv(m), (ww, hh))
             off = (0, atlas_w)  # on the histology (right) side
             if 'preview_boundaries' in viewer.layers:
-                viewer.layers['preview_boundaries'].data = binv
+                pv = viewer.layers['preview_boundaries']
+                pv.data = binv
             else:
-                viewer.add_image(binv, name='preview_boundaries', colormap=orange,
-                                 blending='additive', opacity=0.9, translate=off)
+                pv = viewer.add_image(binv, name='preview_boundaries',
+                                      blending='additive', opacity=0.9, translate=off)
+            pv.colormap = bound_layer.colormap  # keep preview boundaries the same color as the atlas panel
             # keep the points on top so they stay visible/clickable over the overlay
             for layer in (atlas_pts, slice_pts):
                 viewer.layers.move(viewer.layers.index(layer), len(viewer.layers) - 1)
@@ -289,19 +379,25 @@ class RegisterOptions(AbstractParser):
             except ValueError as e:
                 status.value = f'save failed: {e}'
                 return
+            contrast = tuple(float(v) for v in hist_layer.contrast_limits)
             save_transform(m, output_dir=out_dir, name=name, plane=self.cut_plane,
                            resolution=self.resolution, slice_index=state['index'],
-                           dw=state['dw'], dh=state['dh'], slice_xy=s, atlas_xy=a)
+                           dw=state['dw'], dh=state['dh'], slice_xy=s, atlas_xy=a,
+                           rotate=rot_w.value, flip_lr=self.flip_lr, flip_ud=self.flip_ud,
+                           contrast=contrast)
 
-            # warped histology in atlas space, and a copy with the orange boundaries burned in
-            warped = _u8(apply_transformation(hist, m))
+            # warped histology in atlas space, and a copy with the boundaries burned in.
+            # bake the layer's contrast window so the .tif matches what you see.
+            warped = _to_u8(apply_transformation(state['hist'], m), contrast)
             trans_path = out_dir / f'{name}_transformed.tif'
             iio.imwrite(trans_path, warped)
             print_save(trans_path)
 
             rgb = warped if warped.ndim == 3 else np.stack([warped] * 3, axis=-1)
             rgb = rgb[..., :3].copy()
-            rgb[boundary_mask(state['ann']).astype(bool)] = (255, 140, 0)
+            # use the color currently shown on the left atlas panel so the saved overlay matches
+            bcol = np.asarray(bound_layer.colormap.colors[-1])[:3]
+            rgb[boundary_mask(state['ann']).astype(bool)] = tuple(int(c * 255) for c in bcol)
             overlay_path = out_dir / f'{name}_overlay.tif'
             iio.imwrite(overlay_path, rgb)
             print_save(overlay_path)
@@ -338,9 +434,19 @@ class RegisterOptions(AbstractParser):
         clear_btn = PushButton(text='Clear all points')
         clear_btn.changed.connect(on_clear)
 
+        if load.get('slice_xy') or load.get('atlas_xy'):
+            ax = np.asarray(load.get('atlas_xy', []), dtype=float).reshape(-1, 2)
+            sx = np.asarray(load.get('slice_xy', []), dtype=float).reshape(-1, 2)
+            atlas_pts.data = ax[:, ::-1] if len(ax) else np.empty((0, 2))           # (x,y)->(row,col)
+            slice_pts.data = sx[:, ::-1] + np.array([0, atlas_w]) if len(sx) else np.empty((0, 2))
+            renumber(atlas_pts)
+            renumber(slice_pts)
+            state['expect'] = 'atlas' if len(ax) == len(sx) else 'slice'
+            status.value = f'resumed: {len(sx)} pair(s) loaded'
+
         viewer.window.add_dock_widget(
-            Container(widgets=[idx_w, dw_w, dh_w, info_w, pick_w, undo_btn, clear_btn,
-                               preview_btn, exit_preview_btn, save_btn, status]),
+            Container(widgets=[idx_w, dw_w, dh_w, rot_w, info_w, pick_w, grid_w, color_w,
+                               undo_btn, clear_btn, preview_btn, exit_preview_btn, save_btn, status]),
             area='right', name='register'
         )
         fprint(f'registering {name}: pick points, Preview to verify, Save when done')

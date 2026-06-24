@@ -24,18 +24,18 @@ class ViewOptions(AbstractParser):
         help='raw image path (after resize to allen space)'
     )
 
-    trans_matrix: Path = argument(
+    trans_matrix: Path | None = argument(
         '-T', '--trans',
-        validator=validator.path.is_exists(),
+        default=None,
         group=GROUP_IO,
-        help='transform matrix (3 x 3) .mat file'
+        help='transform matrix (3 x 3) .mat file (legacy MATLAB only; native .json carries the matrix)'
     )
 
     ccf_data: Path = argument(
         '-C', '--ccf',
         validator=validator.path.is_exists(),
         group=GROUP_IO,
-        help='ccf transformed .mat file'
+        help='registration .json (native) or ccf transformed .mat file (legacy)'
     )
 
     output: Path | None = argument(
@@ -113,7 +113,25 @@ class ViewOptions(AbstractParser):
             self._stop_render = True
 
     def _run(self):
-        raw, trans = slice_transform_helper(self.raw_image, self.trans_matrix, plane_type=self.cut_plane)
+        if self.ccf_data.suffix == '.json':
+            # reproduce the registration preprocessing: raw -> flip -> rotate -> resize -> apply
+            import imageio.v3 as iio
+            import numpy as np
+            from ccf2d.main_register import _rotate
+            meta = json.loads(self.ccf_data.read_text())
+            img = iio.imread(self.raw_image)
+            if meta.get('flip_ud'):
+                img = np.flipud(img)
+            if meta.get('flip_lr'):
+                img = np.fliplr(img)
+            img = _rotate(img, float(meta.get('rotate', 0.0)))
+            matrix = np.array(meta['matrix'], dtype=float)
+            raw, trans = slice_transform_helper(img, matrix, plane_type=self.cut_plane)
+        else:
+            if self.trans_matrix is None:
+                raise ValueError('a .mat ccf_data (-C) needs the matrix via -T/--trans')
+            raw, trans = slice_transform_helper(self.raw_image, self.trans_matrix, plane_type=self.cut_plane)
+
         x, y = SLICE_DIMENSION_10um[self.cut_plane]
         extent = (-x / 2, x / 2, -y / 2, y / 2)
 
