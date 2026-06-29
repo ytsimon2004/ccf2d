@@ -153,6 +153,12 @@ class RegisterOptions(AbstractParser):
         atlas_layer = viewer.add_image(plane_image(), name='atlas', colormap='gray')
         bound_layer = viewer.add_image(boundary_mask(state['ann']), name='boundaries',
                                        colormap=bcmap, blending='additive', opacity=0.9)
+        # filled overlay of the atlas region under the cursor (updated in on_move)
+        hcmap = Colormap([[0, 0, 0], [0.3, 0.6, 1.0]], name='highlight')
+        highlight_layer = viewer.add_image(np.zeros(state['ann'].shape, dtype=float),
+                                           name='region_highlight', colormap=hcmap,
+                                           blending='additive', opacity=0.4)
+        state['hover_id'] = None
         hist_layer = viewer.add_image(state['hist'], name='histology', translate=(0, atlas_w))
 
         # reference xy grid over the histology (toggled off), 100 px spacing. drawn as an
@@ -283,10 +289,15 @@ class RegisterOptions(AbstractParser):
         status.native.setStyleSheet('font-size: 15px; font-weight: bold; color: #ffcc00;')
         status.native.setWordWrap(True)
 
+        def reset_highlight():
+            highlight_layer.data = np.zeros(state['ann'].shape, dtype=float)
+            state['hover_id'] = None
+
         def refresh(*_):
             state['index'], state['dw'], state['dh'] = idx_w.value, dw_w.value, dh_w.value
             atlas_layer.data = plane_image()
             bound_layer.data = boundary_mask(state['ann'])
+            reset_highlight()  # annotation plane changed; stale mask
             info_w.value = info_text()
 
         idx_w.changed.connect(refresh)
@@ -296,7 +307,14 @@ class RegisterOptions(AbstractParser):
         @viewer.mouse_move_callbacks.append
         def on_move(_v, event):
             y, x = event.position
-            viewer.text_overlay.text = region_name(state['ann'], structures, y, x)
+            ann = state['ann']
+            viewer.text_overlay.text = region_name(ann, structures, y, x)
+            rid = (int(ann[int(y), int(x)])
+                   if 0 <= y < ann.shape[0] and 0 <= x < ann.shape[1] else 0)
+            if rid != state['hover_id']:
+                state['hover_id'] = rid
+                # ponytail: full-plane mask (~1e6 px), recomputed only when crossing a region edge
+                highlight_layer.data = (ann == rid).astype(float) if rid else np.zeros(ann.shape)
 
         def collect() -> tuple[np.ndarray, np.ndarray]:
             # napari points are (row, col); convert to (x, y), un-translate the slice side
@@ -408,6 +426,7 @@ class RegisterOptions(AbstractParser):
 
             atlas_layer.data = plane_image()
             bound_layer.data = boundary_mask(state['ann'])
+            reset_highlight()  # new plane/shape
             state['hist'] = make_hist(rot_w.value)
             set_histology(state['hist'])
 
@@ -517,11 +536,28 @@ class RegisterOptions(AbstractParser):
         elif state['files']:
             load_slice(0)  # show "i/N" + auto-resume the first serial section
 
+        def header(text):
+            lbl = Label(value=text)
+            lbl.native.setStyleSheet('font-weight: bold; color: #88c0d0; padding-top: 6px;')
+            return lbl
+
+        def row(*ws):
+            return Container(widgets=list(ws), layout='horizontal', labels=False)
+
+        panel = Container(
+            widgets=[
+                header('Image'), load_btn, load_dir_btn, row(prev_btn, next_btn),
+                header('Atlas plane'), plane_w, idx_w, dw_w, dh_w, info_w,
+                header('Orientation'), rot_w, flip_lr_w, flip_ud_w,
+                header('Display'), grid_w, color_w,
+                header('Points'), pick_w, row(undo_btn, clear_btn),
+                header('Overlay & save'), row(preview_btn, exit_preview_btn), save_btn,
+                status,
+            ]
+        )
+        panel.native.setStyleSheet('QPushButton { padding: 4px; }')
         viewer.window.add_dock_widget(
-            Container(widgets=[load_btn, load_dir_btn, prev_btn, next_btn, plane_w, idx_w, dw_w, dh_w,
-                               rot_w, flip_lr_w, flip_ud_w, info_w, pick_w, grid_w, color_w, undo_btn, clear_btn,
-                               preview_btn, exit_preview_btn, save_btn, status]),
-            area='right', name='register'
+            panel, area='right', name='register'
         )
         fprint(f'registering {name}: pick points, Preview to verify, Save when done')
         napari.run()
