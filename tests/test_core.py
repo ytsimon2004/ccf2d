@@ -92,3 +92,19 @@ def test_save_transform_roundtrip(tmp_path):
     assert np.allclose(np.array(meta['matrix']), m)
     assert meta['rotate'] == 12.5 and meta['flip_lr'] is True
     assert meta['contrast'] == [20.0, 800.0] and meta['slice_index'] == 540
+
+
+# --- probe reconstruction --------------------------------------------------
+
+def test_plane_point_to_ccf_mm_coronal_bregma():
+    # coronal project_index (plane=AP, x=ML, y=DV); at the bregma plane AP must be 0
+    ap, dv, ml = core.plane_point_to_ccf_mm(540, 400, 300, project_index=(0, 2, 1),
+                                            resolution=10, bregma_10um=(540, 0, 570))
+    assert ap == 0.0                    # on the bregma AP plane
+    assert dv == 3.0                    # 300 voxel * 10µm = 3000µm below bregma DV(0)
+    assert ml == pytest.approx(1.7)     # (570 - 400) * 10µm = 1700µm right of midline
+
+    # round-trip against neuralib's forward transform
+    from neuralib.atlas.util import allen_to_brainrender_coord
+    out = allen_to_brainrender_coord(np.array([[ap, dv, ml]]))[0]
+    assert np.allclose(out, [540 * 10, 300 * 10, 400 * 10])  # back to absolute µm voxels

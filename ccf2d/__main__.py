@@ -1,6 +1,7 @@
 from argclz.commands import parse_command_args
 
 from .main_init import InitOptions
+from .main_probe import ProbeOptions
 from .main_register import RegisterOptions
 from .main_view import ViewOptions
 
@@ -11,6 +12,7 @@ def main():
         parsers=dict(
             init=InitOptions,
             register=RegisterOptions,
-            view=ViewOptions
+            view=ViewOptions,
+            probe=ProbeOptions
         )
     )

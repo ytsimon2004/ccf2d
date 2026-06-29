@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -18,6 +19,24 @@ from ccf2d.core import (boundary_mask, estimate_transform, read_oriented, region
                         rotate, save_transform, to_uint8)
 
 __all__ = ['RegisterOptions']
+
+
+class TerminalLog:
+    """Append-only view over a magicgui Label so ``status.value = msg`` scrolls like a terminal
+    (keeps the last ``maxlines`` messages) instead of replacing a single line."""
+
+    def __init__(self, label, maxlines: int = 12):
+        self._label = label
+        self._lines: deque[str] = deque(maxlen=maxlines)
+
+    @property
+    def value(self) -> str:
+        return '\n'.join(self._lines)
+
+    @value.setter
+    def value(self, msg: str):
+        self._lines.append(f'> {msg}')
+        self._label.value = '\n'.join(self._lines)
 
 
 class RegisterOptions(AbstractParser):
@@ -241,8 +260,6 @@ class RegisterOptions(AbstractParser):
             state['brgb'] = to_rgb(color_w.value)
             cm = Colormap([[0, 0, 0], list(state['brgb'])], name='boundary')
             bound_layer.colormap = cm
-            if 'preview_boundaries' in viewer.layers:
-                viewer.layers['preview_boundaries'].colormap = cm
 
         color_w.changed.connect(set_bcolor)
 
@@ -270,13 +287,14 @@ class RegisterOptions(AbstractParser):
         flip_lr_w.changed.connect(set_flip)
         flip_ud_w.changed.connect(set_flip)
 
-        for w in (rot_w, flip_lr_w, flip_ud_w):
-            w.tooltip = 'clear points to re-orient'
+        for w in (plane_w, rot_w, flip_lr_w, flip_ud_w, idx_w, dw_w, dh_w):
+            w.tooltip = 'clear points (or Re-register) to change the atlas plane / orientation'
 
         def sync_orient_lock():
-            # orient-first: rotate/flip allowed only before any point is picked
+            # plane-first: the plane, atlas index/tilt and slice orientation are fixed once any
+            # point is picked, since changing them moves the plane out from under the points
             locked = bool(len(atlas_pts.data) or len(slice_pts.data))
-            for w in (rot_w, flip_lr_w, flip_ud_w):
+            for w in (plane_w, rot_w, flip_lr_w, flip_ud_w, idx_w, dw_w, dh_w):
                 w.enabled = not locked
 
         def info_text() -> str:
@@ -284,10 +302,14 @@ class RegisterOptions(AbstractParser):
                     f"dw {state['dw'] * res} µm, dh {state['dh'] * res} µm")
 
         info_w = Label(value=info_text())
-        status = Label(value='click an atlas landmark (left), then its match on the slice (right)')
-        # make the live instruction line stand out (applies to every status.value message)
-        status.native.setStyleSheet('font-size: 15px; font-weight: bold; color: #ffcc00;')
-        status.native.setWordWrap(True)
+        # scrolling terminal-style log: every status.value = msg appends a line (monospace)
+        status_label = Label(value='')
+        status_label.native.setStyleSheet(
+            'font-family: Menlo, Consolas, monospace; font-size: 12px; '
+            'color: #b9f27c; background: #11131a; padding: 6px;')
+        status_label.native.setWordWrap(True)
+        status = TerminalLog(status_label)
+        status.value = 'click an atlas landmark (left), then its match on the slice (right)'
 
         def reset_highlight():
             highlight_layer.data = np.zeros(state['ann'].shape, dtype=float)
@@ -329,28 +351,26 @@ class RegisterOptions(AbstractParser):
             except ValueError as e:
                 status.value = f'preview failed: {e}'
                 return
-            # inverse-warp the atlas boundaries into raw-slice space so they overlay the
-            # (unmodified) histology -> points stay visible and can still be added/adjusted
-            bmask = boundary_mask(state['ann'])
-            hh, ww = state['hist'].shape[:2]
-            binv = cv2.warpPerspective(bmask, np.linalg.inv(m), (ww, hh))
-            off = (0, atlas_w)  # on the histology (right) side
-            if 'preview_boundaries' in viewer.layers:
-                pv = viewer.layers['preview_boundaries']
-                pv.data = binv
-            else:
-                pv = viewer.add_image(binv, name='preview_boundaries',
-                                      blending='additive', opacity=0.9, translate=off)
-            pv.colormap = bound_layer.colormap  # keep preview boundaries the same color as the atlas panel
-            # keep the points on top so they stay visible/clickable over the overlay
+            # warp the histology into atlas space and overlay it on the atlas (left) side, under the
+            # real atlas boundaries -> you see the transformed histology with the straight boundaries
+            warped = apply_transformation(state['hist'], m)
+            if 'preview_transformed' in viewer.layers:
+                viewer.layers.remove('preview_transformed')  # re-create (grayscale<->RGB safe)
+            pv = viewer.add_image(warped, name='preview_transformed', opacity=1.0)
+            # order bottom->top: atlas, transformed histology, boundaries, points
+            viewer.layers.move(viewer.layers.index(pv), viewer.layers.index(bound_layer))
             for layer in (atlas_pts, slice_pts):
                 viewer.layers.move(viewer.layers.index(layer), len(viewer.layers) - 1)
-            status.value = 'preview: atlas boundaries on your slice — keep adjusting points, then Exit preview'
+            status.value = 'preview on: transformed histology under the atlas boundaries — toggle off/on to refresh after moving points'
 
         def on_exit_preview():
-            if 'preview_boundaries' in viewer.layers:
-                viewer.layers.remove('preview_boundaries')
+            if 'preview_transformed' in viewer.layers:
+                viewer.layers.remove('preview_transformed')
             status.value = 'preview closed'
+
+        def confirm(title: str, text: str) -> bool:
+            from qtpy.QtWidgets import QMessageBox
+            return QMessageBox.question(None, title, text) == QMessageBox.Yes
 
         def on_save():
             if self._oriented is None:
@@ -363,6 +383,11 @@ class RegisterOptions(AbstractParser):
                 status.value = f'save failed: {e}'
                 return
             out_dir, name = state['out_dir'], state['name']
+            js = out_dir / f'{name}_transform.json'
+            if js.exists() and not confirm('Overwrite registration?',
+                                           f'{js.name} already exists. Overwrite it?'):
+                status.value = 'save cancelled'
+                return
             contrast = tuple(float(v) for v in hist_layer.contrast_limits)
             print_save(save_transform(m, output_dir=out_dir, name=name, plane=self.cut_plane,
                                       resolution=self.resolution, slice_index=state['index'],
@@ -409,6 +434,17 @@ class RegisterOptions(AbstractParser):
             sync_orient_lock()
             status.value = 'cleared all points'
 
+        def on_reregister():
+            if not (len(atlas_pts.data) or len(slice_pts.data)):
+                status.value = 'nothing to re-register — no points loaded'
+                return
+            if not confirm('Re-register this slice?',
+                           'Discard the loaded points and start picking again?\n'
+                           '(the saved file is kept until you Save again)'):
+                return
+            on_clear()  # unlocks plane / index / tilt / orientation
+            status.value = 're-registering: plane & orientation unlocked — pick points again'
+
         def rebuild_plane(*_):
             # plane drives the atlas/annotation views, dimensions and atlas_w; rebuild them all
             nonlocal ref_view, ann_view, atlas_w, dim
@@ -445,7 +481,11 @@ class RegisterOptions(AbstractParser):
         plane_w.changed.connect(rebuild_plane)
 
         def restore_from_meta(meta: dict):
-            # set widgets first (their callbacks rebuild the view / clear stale points), then points
+            # set widgets first (their callbacks rebuild the view / clear stale points), then points.
+            # plane first: rebuild_plane resets dims/atlas_w/index, so it must run before the rest
+            saved_plane = meta.get('plane')
+            if saved_plane and saved_plane != plane_w.value:
+                plane_w.value = saved_plane  # triggers rebuild_plane
             idx_w.value = int(meta.get('slice_index', idx_w.value))
             dw_w.value = int(meta.get('dw', 0))
             dh_w.value = int(meta.get('dh', 0))
@@ -519,16 +559,16 @@ class RegisterOptions(AbstractParser):
         prev_btn.changed.connect(lambda *_: load_slice(-1))
         next_btn = PushButton(text='Next slice ▶')
         next_btn.changed.connect(lambda *_: load_slice(+1))
-        preview_btn = PushButton(text='Preview overlay')
-        preview_btn.changed.connect(on_preview)
-        exit_preview_btn = PushButton(text='Exit preview')
-        exit_preview_btn.changed.connect(on_exit_preview)
+        preview_w = CheckBox(label='preview overlay', value=False)
+        preview_w.changed.connect(lambda *_: on_preview() if preview_w.value else on_exit_preview())
         save_btn = PushButton(text='Save transform')
         save_btn.changed.connect(on_save)
         undo_btn = PushButton(text='Undo last point')
         undo_btn.changed.connect(on_undo)
         clear_btn = PushButton(text='Clear all points')
         clear_btn.changed.connect(on_clear)
+        reregister_btn = PushButton(text='Re-register (clear & redo)')
+        reregister_btn.changed.connect(on_reregister)
 
         if load.get('slice_xy') or load.get('atlas_xy'):
             restore_from_meta(load)
@@ -550,9 +590,9 @@ class RegisterOptions(AbstractParser):
                 header('Atlas plane'), plane_w, idx_w, dw_w, dh_w, info_w,
                 header('Orientation'), rot_w, flip_lr_w, flip_ud_w,
                 header('Display'), grid_w, color_w,
-                header('Points'), pick_w, row(undo_btn, clear_btn),
-                header('Overlay & save'), row(preview_btn, exit_preview_btn), save_btn,
-                status,
+                header('Points'), pick_w, row(undo_btn, clear_btn), reregister_btn,
+                header('Overlay & save'), preview_w, save_btn,
+                status_label,
             ]
         )
         panel.native.setStyleSheet('QPushButton { padding: 4px; }')

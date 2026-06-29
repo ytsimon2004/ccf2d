@@ -17,7 +17,7 @@ from neuralib.atlas.typing import PLANE_TYPE
 
 __all__ = [
     'read_oriented', 'rotate', 'to_uint8', 'boundary_mask', 'region_name',
-    'estimate_transform', 'save_transform',
+    'estimate_transform', 'save_transform', 'plane_point_to_ccf_mm',
 ]
 
 
@@ -134,3 +134,31 @@ def save_transform(matrix: np.ndarray, *,
     js = output_dir / f'{name}_transform.json'
     js.write_text(json.dumps(meta, indent=2))
     return js
+
+
+# --- probe reconstruction --------------------------------------------------
+
+def plane_point_to_ccf_mm(plane_num: float, x: float, y: float, *,
+                          project_index: tuple[int, int, int],
+                          resolution: int,
+                          bregma_10um: tuple[int, int, int] = (540, 0, 570),
+                          ) -> tuple[float, float, float]:
+    """A clicked atlas-plane pixel ``(x, y)`` on plane number ``plane_num`` -> bregma-relative
+    CCF ``(AP, DV, ML)`` in mm.
+
+    This is the inverse of ``neuralib.atlas.util.allen_to_brainrender_coord``, so a CSV of these
+    points feeds ``ProbeRenderCLI`` (the existing interpolation + brainrender) directly.
+
+    :param plane_num: voxel plane index the pixel sits on (``slice_index`` + tilt offset).
+    :param x: atlas-plane column (the view's ``project_index`` x axis).
+    :param y: atlas-plane row (the view's ``project_index`` y axis).
+    :param project_index: ``view.project_index`` — (plane, x, y) positions within (AP, DV, ML).
+    :param resolution: atlas resolution (µm).
+    :param bregma_10um: bregma in 10µm voxels, AP/DV/ML (``ALLEN_CCF_10um_BREGMA``).
+    """
+    pidx, xidx, yidx = project_index
+    idx = [0.0, 0.0, 0.0]
+    idx[pidx], idx[xidx], idx[yidx] = plane_num, x, y
+    ap, dv, ml = (v * resolution for v in idx)      # voxel -> µm (absolute)
+    bap, bdv, bml = (b * 10 for b in bregma_10um)   # 10µm voxel -> µm
+    return (bap - ap) / 1000, (dv - bdv) / 1000, (bml - ml) / 1000
