@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import cv2
 import imageio.v3 as iio
@@ -20,8 +20,31 @@ from neuralib.atlas.typing import PLANE_TYPE
 __all__ = [
     'read_oriented', 'rotate', 'to_uint8', 'boundary_mask', 'region_name',
     'estimate_transform', 'save_transform', 'plane_point_to_ccf_mm', 'ccf_mm_to_plane_point',
-    'raw_points_to_atlas', 'TerminalLog',
+    'raw_points_to_atlas', 'TransformMeta', 'load_transform', 'TerminalLog',
 ]
+
+
+class TransformMeta(TypedDict):
+    """Schema of a ``*_transform.json`` — the histology→atlas registration written by
+    ``save_transform`` and consumed by the probe/roi modes. ``rotate``/``flip_lr``/``flip_ud``
+    record the preprocessing so raw points can be replayed into atlas space."""
+    matrix: list[list[float]]  # 3x3 homography (resized-slice -> atlas-plane pixels)
+    plane: PLANE_TYPE
+    resolution: int
+    slice_index: int
+    dw: int
+    dh: int
+    rotate: float
+    flip_lr: bool
+    flip_ud: bool
+    contrast: list[float] | None
+    slice_xy: list[list[float]]
+    atlas_xy: list[list[float]]
+
+
+def load_transform(path: Path) -> TransformMeta:
+    """Read and parse a ``*_transform.json``."""
+    return json.loads(Path(path).read_text())
 
 
 class TerminalLog:
@@ -138,7 +161,7 @@ def save_transform(matrix: np.ndarray, *,
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    meta = {
+    meta: TransformMeta = {
         'matrix': np.asarray(matrix, dtype=float).tolist(),
         'plane': plane,
         'resolution': resolution,

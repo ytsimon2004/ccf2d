@@ -61,9 +61,10 @@ def test_project_raw_rois_basic():
 def test_write_channel_csvs(tmp_path):
     rows = [{'AP_location': 0.1, 'DV_location': 0.2, 'ML_location': 0.3, 'region': 'X',
              'source': 's1', 'channel': ch} for ch in ('R', 'R', 'G')]
-    out = write_channel_csvs(rows, tmp_path / 'roi_points_ccf.csv')
+    out = write_channel_csvs(rows, tmp_path)
     assert [c for c, _ in out] == ['G', 'R']  # sorted, one file per channel
     by_ch = dict(out)
+    assert by_ch['R'].name == 'roi_ccf_R.csv'
     assert pl.read_csv(by_ch['R']).height == 2 and pl.read_csv(by_ch['G']).height == 1
     assert 'channel' not in pl.read_csv(by_ch['R']).columns  # per-file csv is plain AP/DV/ML+region+source
 

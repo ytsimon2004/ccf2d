@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +10,7 @@ from neuralib.atlas.ccf.matrix import slice_transform_helper
 from neuralib.atlas.util import ALLEN_CCF_10um_BREGMA
 from neuralib.util.verbose import fprint, print_save
 
-from ccf2d.core import (boundary_mask, ccf_mm_to_plane_point, plane_point_to_ccf_mm,
+from ccf2d.core import (boundary_mask, ccf_mm_to_plane_point, load_transform, plane_point_to_ccf_mm,
                         read_oriented, rotate)
 from ccf2d.slice_app import RegionPicker, SliceReconstructOptions
 
@@ -145,7 +144,7 @@ class ProbeOptions(SliceReconstructOptions):
                 status.value = f'no registration for {img.name} — skip or register it first'
                 return
 
-            meta = json.loads(tp.read_text())
+            meta = load_transform(tp)
             plane, res = meta['plane'], int(meta['resolution'])
             idx, dw, dh = int(meta['slice_index']), int(meta['dw']), int(meta['dh'])
             oimg = rotate(read_oriented(img, meta.get('flip_lr', False), meta.get('flip_ud', False)),

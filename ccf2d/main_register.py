@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import cv2
@@ -14,8 +13,8 @@ from neuralib.atlas.view import get_slice_view
 from neuralib.imglib.transform import apply_transformation
 from neuralib.util.verbose import fprint, print_save
 
-from ccf2d.core import (TerminalLog, boundary_mask, estimate_transform, read_oriented, region_name,
-                        rotate, save_transform, to_uint8)
+from ccf2d.core import (TerminalLog, boundary_mask, estimate_transform, load_transform, read_oriented,
+                        region_name, rotate, save_transform, to_uint8)
 
 __all__ = ['RegisterOptions']
 
@@ -74,7 +73,7 @@ class RegisterOptions(AbstractParser):
             raise ValueError(f'plane {self.cut_plane!r} not supported yet '
                              f'(available: {list(SLICE_DIMENSION_10um)})')
 
-        load = json.loads(self.load.read_text()) if self.load else None
+        load = load_transform(self.load) if self.load else None
         if load:  # resume: preprocessing must match the saved session
             self.flip_lr = load.get('flip_lr', self.flip_lr)
             self.flip_ud = load.get('flip_ud', self.flip_ud)
@@ -501,7 +500,7 @@ class RegisterOptions(AbstractParser):
             img_lbl.value = f'{pos}{p.name}'
             js = state['out_dir'] / f'{p.stem}_transform.json'
             if js.exists():
-                restore_from_meta(json.loads(js.read_text()))
+                restore_from_meta(load_transform(js))
                 status.value = f'{p.name} — resumed saved registration'
             else:
                 status.value = f'loaded {p.name} — pick points'
@@ -514,6 +513,15 @@ class RegisterOptions(AbstractParser):
             if path:
                 state['files'] = []  # single image: leave serial mode
                 load_image_path(Path(path))
+
+        def on_load_json():
+            # reuse another slice's registration (plane/index/tilt/orientation + points) on this image
+            from qtpy.QtWidgets import QFileDialog
+            path, _ = QFileDialog.getOpenFileName(
+                caption='Load transform JSON', filter='JSON (*.json);;All files (*)')
+            if path:
+                restore_from_meta(load_transform(Path(path)))
+                status.value = f'loaded {Path(path).name} — Preview to check, Save to write it here'
 
         def on_load_dir():
             from qtpy.QtWidgets import QFileDialog
@@ -543,6 +551,8 @@ class RegisterOptions(AbstractParser):
         load_btn.changed.connect(on_load_image)
         load_dir_btn = PushButton(text='Load dir (serial)')
         load_dir_btn.changed.connect(on_load_dir)
+        load_json_btn = PushButton(text='Load transform (json)')
+        load_json_btn.changed.connect(on_load_json)
         prev_btn = PushButton(text='◀ Prev slice')
         prev_btn.changed.connect(lambda *_: load_slice(-1))
         next_btn = PushButton(text='Next slice ▶')
@@ -566,7 +576,7 @@ class RegisterOptions(AbstractParser):
         elif self.raw_image is not None:  # single -I: auto-resume its saved transform like directory mode
             js = out_dir / f'{name}_transform.json'
             if js.exists():
-                restore_from_meta(json.loads(js.read_text()))
+                restore_from_meta(load_transform(js))
                 status.value = f'{name} — resumed saved registration'
 
         def header(text):
@@ -579,7 +589,7 @@ class RegisterOptions(AbstractParser):
 
         panel = Container(
             widgets=[
-                header('Image'), img_lbl, load_btn, load_dir_btn, row(prev_btn, next_btn),
+                header('Image'), img_lbl, load_btn, load_dir_btn, load_json_btn, row(prev_btn, next_btn),
                 header('Atlas plane'), plane_w, idx_w, dw_w, dh_w, info_w,
                 header('Orientation'), rot_w, flip_lr_w, flip_ud_w,
                 header('Display'), grid_w, color_w,

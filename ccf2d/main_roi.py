@@ -9,7 +9,7 @@ function used by both the GUI "Project + Render" button and the headless ``--pro
 """
 from __future__ import annotations
 
-import json
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -17,13 +17,12 @@ import numpy as np
 import polars as pl
 from argclz import argument
 from brainglobe_atlasapi import BrainGlobeAtlas
+from neuralib.atlas.ccf.matrix import slice_transform_helper
 from neuralib.atlas.util import ALLEN_CCF_10um_BREGMA
 from neuralib.util.verbose import fprint, print_save
 
-from neuralib.atlas.ccf.matrix import slice_transform_helper
-
-from ccf2d.core import (boundary_mask, plane_point_to_ccf_mm, raw_points_to_atlas, read_oriented,
-                        region_name, rotate)
+from ccf2d.core import (boundary_mask, load_transform, plane_point_to_ccf_mm, raw_points_to_atlas,
+                        read_oriented, region_name, rotate)
 from ccf2d.slice_app import RegionPicker, SliceReconstructOptions
 
 __all__ = ['RoiOptions', 'project_raw_rois']
@@ -80,16 +79,23 @@ def project_raw_rois(rows, get_views, structures, transform_for):
     return ccf_rows, missing
 
 
-def write_channel_csvs(ccf_rows, ccf_csv: Path) -> list[tuple[str, Path]]:
-    """Split projected rows into one CCF csv per channel (so each renders as its own colored cloud).
+def _render_tmpdir() -> Path:
+    # per-channel render inputs live in a throwaway temp dir; the OS reaps it, the data folder stays clean
+    return Path(tempfile.mkdtemp(prefix='ccf2d_roi_'))  # ponytail: leak is a few KB in /tmp per render
+
+
+def write_channel_csvs(ccf_rows, dest_dir: Path) -> list[tuple[str, Path]]:
+    """Split projected rows into one plain CCF csv per channel inside ``dest_dir`` (brainrender
+    renders one --file per color). These are render inputs, not user artifacts — pass a temp dir.
     Returns ``[(channel, path), ...]`` in stable channel order."""
     groups: dict[str, list] = defaultdict(list)
     for r in ccf_rows:
         groups[r.get('channel', 'merge')].append(r)
     cols = ('AP_location', 'DV_location', 'ML_location', 'region', 'source')
+    dest_dir.mkdir(parents=True, exist_ok=True)
     out = []
     for ch in sorted(groups):
-        p = ccf_csv.with_name(f'{ccf_csv.stem}_{ch}.csv')
+        p = dest_dir / f'roi_ccf_{ch}.csv'
         pl.DataFrame([{k: r[k] for k in cols} for r in groups[ch]]).write_csv(p)
         out.append((ch, p))
     return out
@@ -128,7 +134,7 @@ class RoiOptions(SliceReconstructOptions):
         if self.project:
             self._run_project_headless()
             return
-        files = self._resolve_paths('roi_points_raw.csv', require_transform=False)
+        files = self._resolve_paths('roi/roi_points_raw.csv', require_transform=False)
         self._launch_napari(files)
 
     def _ccf_out(self) -> Path:
@@ -136,7 +142,7 @@ class RoiOptions(SliceReconstructOptions):
 
     def _transform_for(self, stem: str):
         p = self._tdir / f'{stem}_transform.json'
-        return json.loads(p.read_text()) if p.exists() else None
+        return load_transform(p) if p.exists() else None
 
     def _project_and_save(self, rows, get_views, structures, status=None):
         """Shared projection: raw rows -> combined CCF csv. Returns ``(path, ccf_rows)`` or ``None``."""
@@ -158,7 +164,7 @@ class RoiOptions(SliceReconstructOptions):
         # resolve the raw csv input + transform dir without needing the images
         raw_csv = self.output or (
             (self.directory or (self.raw_image.parent if self.raw_image else Path.cwd()))
-            / 'roi_points_raw.csv')
+            / 'roi' / 'roi_points_raw.csv')
         base = self.directory or (self.raw_image.parent if self.raw_image else raw_csv.parent)
         self._tdir = self.transform_dir or base / 'transformations'
         self._out = raw_csv
@@ -172,8 +178,8 @@ class RoiOptions(SliceReconstructOptions):
         structures = BrainGlobeAtlas('allen_mouse_10um').structures
         res = self._project_and_save(df.to_dicts(), get_views, structures)
         if res is not None and self.render:
-            path, ccf_rows = res
-            ch_files = write_channel_csvs(ccf_rows, path)
+            _, ccf_rows = res
+            ch_files = write_channel_csvs(ccf_rows, _render_tmpdir())  # per-channel render inputs (temp)
             ch_color = {**_CH_COLOR, 'merge': self.roi_color}
             self.launch_render(_render_argv(ch_files, self.roi_radius, ch_color, {},
                                             SHADER_STYLES[0], False, 'both'))
@@ -407,8 +413,8 @@ class RoiOptions(SliceReconstructOptions):
             save_csv()  # persist raw coords first
             res = self._project_and_save(rows_from_state(), get_views, bg.structures, status)
             if res is not None:
-                path, ccf_rows = res
-                ch_files = write_channel_csvs(ccf_rows, path)  # one colored cloud per channel
+                _, ccf_rows = res
+                ch_files = write_channel_csvs(ccf_rows, _render_tmpdir())  # per-channel render inputs (temp)
                 ch_color = {**_CH_COLOR, 'merge': color_w.value}
                 self.launch_render(
                     _render_argv(ch_files, self.roi_radius, ch_color, regions.colors,
